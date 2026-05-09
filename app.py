@@ -57,6 +57,22 @@ def get_count(json_text):
     except Exception:
         return 0
 
+def extract_cast_names(json_text, max_cast=5):
+    """Extract top-billed actor names (order = billing order in TMDB)."""
+    try:
+        items = safe_literal_eval(json_text)
+        if not isinstance(items, list):
+            return []
+        # sort by 'order' field if present, then take top N
+        sorted_items = sorted(items, key=lambda x: x.get("order", 999))
+        return [
+            item["name"].strip().lower()
+            for item in sorted_items[:max_cast]
+            if isinstance(item, dict) and "name" in item
+        ]
+    except Exception:
+        return []
+
 def clean_text(text):
     if pd.isna(text):
         return ""
@@ -72,21 +88,15 @@ def subjectivity_score(text):
     t = clean_text(text)
     return TextBlob(t).sentiment.subjectivity if t else 0.0
 
-# Expanded keyword list — more specific and genre-aware
 AUDIENCE_WORDS = [
-    # Action / excitement
     "revenge", "survival", "battle", "war", "fight", "escape", "danger",
     "chase", "explosion", "weapon", "mission", "attack", "enemy", "spy",
-    # Emotion / drama
     "love", "family", "friendship", "betrayal", "loss", "grief", "sacrifice",
     "redemption", "forgiveness", "emotional", "powerful", "heartwarming",
-    # Intrigue / mystery
     "secret", "mystery", "murder", "crime", "conspiracy", "haunted",
     "hidden", "truth", "investigation", "detective", "dark",
-    # Fantasy / adventure
     "hero", "adventure", "magic", "legend", "quest", "dragon", "kingdom",
     "epic", "destiny", "power", "ancient", "warrior",
-    # Broad appeal
     "funny", "hilarious", "scary", "thrilling", "romance", "dream",
     "journey", "discovery", "future", "hope",
 ]
@@ -99,11 +109,33 @@ def word_count(text):
     return len(clean_text(text).split())
 
 def release_season(month):
-    """Map month to a season bucket that matters for box office."""
-    if month in [6, 7, 8]:    return "summer"      # blockbuster season
-    if month in [11, 12]:     return "holiday"     # awards / holiday
-    if month in [3, 4, 5]:    return "spring"
+    if month in [6, 7, 8]:   return "summer"
+    if month in [11, 12]:    return "holiday"
+    if month in [3, 4, 5]:   return "spring"
     return "winter"
+
+def compute_star_power(actor_input: str, lookup: dict, global_mean: float):
+    """
+    Given a comma-separated string of actor names, look each up in the
+    historical performance lookup and return the average score.
+    Also returns lists of recognized and unrecognized names for display.
+    """
+    if not actor_input or not actor_input.strip():
+        return global_mean, [], []
+
+    names = [n.strip().lower() for n in actor_input.split(",") if n.strip()]
+    found, not_found = [], []
+    scores = []
+
+    for name in names:
+        if name in lookup:
+            scores.append(lookup[name])
+            found.append(name.title())
+        else:
+            not_found.append(name.title())
+
+    avg = float(np.mean(scores)) if scores else global_mean
+    return avg, found, not_found
 
 
 # ── Load data + train models ──────────────────────────────────────────────────
@@ -113,10 +145,8 @@ def load_and_train():
 
     movies = pd.read_csv(
         "tmdb_5000_movies.csv",
-        engine="python",
-        on_bad_lines="skip",
-        encoding="utf-8",
-        encoding_errors="replace",
+        engine="python", on_bad_lines="skip",
+        encoding="utf-8", encoding_errors="replace",
     )
 
     part1 = pd.read_csv("tmdb_5000_credits_part1.csv", engine="python",
@@ -131,24 +161,18 @@ def load_and_train():
     df = movies.merge(credits, on="id", how="left", suffixes=("", "_credits"))
 
     # ── Feature engineering ───────────────────────────────────────────────────
-
-    df["main_genre"]              = df["genres"].apply(lambda x: get_first_name(x, "Unknown"))
-    df["cast_count"]              = df["cast"].apply(get_count)
-    df["crew_count"]              = df["crew"].apply(get_count)
-
-    # NEW: keywords count from the dedicated keywords column
-    df["tmdb_keyword_count"]      = df["keywords"].apply(get_count)
-
-    # NEW: production company count — more companies = more marketing/distribution
+    df["main_genre"]               = df["genres"].apply(lambda x: get_first_name(x, "Unknown"))
+    df["cast_count"]               = df["cast"].apply(get_count)
+    df["crew_count"]               = df["crew"].apply(get_count)
+    df["tmdb_keyword_count"]       = df["keywords"].apply(get_count)
     df["production_company_count"] = df["production_companies"].apply(get_count)
+    df["cast_names"]               = df["cast"].apply(lambda x: extract_cast_names(x, max_cast=5))
 
     df["release_date"]  = pd.to_datetime(df["release_date"], errors="coerce")
     df["release_year"]  = df["release_date"].dt.year
     df["release_month"] = df["release_date"].dt.month
-
-    # NEW: release season (summer, holiday, spring, winter)
     df["release_season"] = df["release_month"].apply(
-        lambda m: release_season(m) if pd.notna(m) else "unknown"
+        lambda m: release_season(int(m)) if pd.notna(m) else "winter"
     )
 
     for col in ["budget", "revenue", "runtime", "popularity", "vote_average", "vote_count"]:
@@ -159,15 +183,12 @@ def load_and_train():
     df["overview_subjectivity"]  = df["overview"].apply(subjectivity_score)
     df["audience_keyword_count"] = df["overview"].apply(keyword_count)
     df["budget_log"]             = np.log1p(df["budget"].fillna(0))
-
-    # NEW: budget per minute — normalizes budget by runtime
-    df["budget_per_minute"] = np.where(
-        (df["budget"] > 0) & (df["runtime"] > 0),
-        df["budget"] / df["runtime"], np.nan
+    df["budget_per_minute_log"]  = np.log1p(
+        np.where((df["budget"] > 0) & (df["runtime"] > 0),
+                 df["budget"] / df["runtime"], 0)
     )
-    df["budget_per_minute_log"] = np.log1p(df["budget_per_minute"].fillna(0))
 
-    # ── Filter to clean rows ──────────────────────────────────────────────────
+    # ── Filter ────────────────────────────────────────────────────────────────
     mdf = df[
         df["budget"].notna()        & (df["budget"]      > 0) &
         df["revenue"].notna()       & (df["revenue"]     > 0) &
@@ -182,16 +203,41 @@ def load_and_train():
 
     mdf["roi"] = mdf["revenue"] / mdf["budget"]
 
-    # ── Performance score (same weighting as before) ──────────────────────────
+    # ── Performance score ─────────────────────────────────────────────────────
     mdf["performance_score"] = (
         mdf["vote_average"].rank(pct=True)         * 0.30 +
         np.log1p(mdf["popularity"]).rank(pct=True) * 0.25 +
         np.log1p(mdf["vote_count"]).rank(pct=True) * 0.20 +
         np.log1p(mdf["roi"]).rank(pct=True)        * 0.25
     )
-
     mdf = mdf.dropna(subset=["performance_score"]).copy()
 
+    # ── Build actor star power lookup ─────────────────────────────────────────
+    # For each actor, average the performance_score of all their movies
+    actor_scores = {}
+    for _, row in mdf[["cast_names", "performance_score"]].iterrows():
+        score = row["performance_score"]
+        for name in row["cast_names"]:
+            if name not in actor_scores:
+                actor_scores[name] = []
+            actor_scores[name].append(score)
+
+    # Only keep actors with at least 2 movie appearances (more reliable signal)
+    actor_lookup = {
+        name: float(np.mean(scores))
+        for name, scores in actor_scores.items()
+        if len(scores) >= 2
+    }
+    global_mean = float(mdf["performance_score"].mean())
+
+    # Add cast_star_power as a feature for each training movie
+    def row_star_power(cast_names):
+        scores = [actor_lookup[n] for n in cast_names if n in actor_lookup]
+        return float(np.mean(scores)) if scores else global_mean
+
+    mdf["cast_star_power"] = mdf["cast_names"].apply(row_star_power)
+
+    # ── Labels ────────────────────────────────────────────────────────────────
     low_cut  = mdf["performance_score"].quantile(0.33)
     high_cut = mdf["performance_score"].quantile(0.67)
 
@@ -204,15 +250,16 @@ def load_and_train():
     mdf["performance_label"] = mdf["performance_score"].apply(label)
     mdf = mdf.dropna(subset=["performance_label"]).copy()
 
-    # ── Feature matrix — more features than before ────────────────────────────
+    # ── Feature matrix ────────────────────────────────────────────────────────
     features = [
         "budget_log",
-        "budget_per_minute_log",       # NEW
+        "budget_per_minute_log",
         "runtime",
         "cast_count",
         "crew_count",
-        "tmdb_keyword_count",          # NEW
-        "production_company_count",    # NEW
+        "tmdb_keyword_count",
+        "production_company_count",
+        "cast_star_power",          # ← NEW: actor historical performance
         "release_year",
         "release_month",
         "overview_word_count",
@@ -220,7 +267,7 @@ def load_and_train():
         "overview_subjectivity",
         "audience_keyword_count",
         "main_genre",
-        "release_season",              # NEW
+        "release_season",
     ]
 
     X = pd.get_dummies(
@@ -235,7 +282,7 @@ def load_and_train():
         X, y, test_size=0.25, random_state=42, stratify=y
     )
 
-    # ── Individual models ─────────────────────────────────────────────────────
+    # ── Train ensemble ────────────────────────────────────────────────────────
     lr = Pipeline([
         ("scaler", StandardScaler(with_mean=False)),
         ("model",  LogisticRegression(max_iter=1000, class_weight="balanced", C=0.5)),
@@ -245,17 +292,13 @@ def load_and_train():
         random_state=42, class_weight="balanced"
     )
     gb = GradientBoostingClassifier(
-        n_estimators=200, max_depth=4, learning_rate=0.08,
-        random_state=42
+        n_estimators=200, max_depth=4, learning_rate=0.08, random_state=42
     )
-
-    # ── Ensemble: soft voting combines all 3 for a stronger prediction ────────
     ensemble = VotingClassifier(
         estimators=[("lr", lr), ("rf", rf), ("gb", gb)],
         voting="soft",
     )
 
-    # Train all 4 and compare
     model_specs = {
         "Logistic Regression": lr,
         "Random Forest":       rf,
@@ -280,13 +323,9 @@ def load_and_train():
         trained[name] = mdl
 
     results_df = pd.DataFrame(results).T.sort_values("F1", ascending=False)
-
-    # Always use the ensemble as the primary predictor
-    best_name  = "Ensemble (Voting)"
-    best_model = trained[best_name]
+    best_model = trained["Ensemble (Voting)"]
     best_preds = best_model.predict(X_test)
 
-    # Feature importances from Random Forest (best single-model source)
     fi = rf.feature_importances_
     importance_df = (
         pd.DataFrame({"Feature": X.columns, "Importance": fi})
@@ -299,24 +338,32 @@ def load_and_train():
     ])
 
     return {
-        "model":        best_model,
-        "model_name":   best_name,
-        "feature_cols": list(X.columns),
-        "genre_list":   genre_list,
-        "results_df":   results_df,
-        "importance_df":importance_df,
-        "report":       classification_report(y_test, best_preds, zero_division=0),
-        "cm":           confusion_matrix(y_test, best_preds, labels=sorted(y.unique())),
-        "cm_labels":    sorted(y.unique()),
-        "n_train":      len(X_train),
-        "n_test":       len(X_test),
+        "model":         best_model,
+        "model_name":    "Ensemble (Voting)",
+        "feature_cols":  list(X.columns),
+        "genre_list":    genre_list,
+        "actor_lookup":  actor_lookup,
+        "global_mean":   global_mean,
+        "results_df":    results_df,
+        "importance_df": importance_df,
+        "report":        classification_report(y_test, best_preds, zero_division=0),
+        "cm":            confusion_matrix(y_test, best_preds, labels=sorted(y.unique())),
+        "cm_labels":     sorted(y.unique()),
+        "n_train":       len(X_train),
+        "n_test":        len(X_test),
+        "n_actors":      len(actor_lookup),
     }
 
 
 # ── Prediction ────────────────────────────────────────────────────────────────
 
 def make_prediction(state, genre, budget, runtime, year, month,
-                    cast, crew, overview, num_keywords, num_companies):
+                    cast, crew, overview, num_keywords, num_companies,
+                    actor_input):
+
+    star_power, found, not_found = compute_star_power(
+        actor_input, state["actor_lookup"], state["global_mean"]
+    )
     season = release_season(month)
     bpm    = (budget / runtime) if runtime > 0 else 0
 
@@ -328,6 +375,7 @@ def make_prediction(state, genre, budget, runtime, year, month,
         "crew_count":               crew,
         "tmdb_keyword_count":       num_keywords,
         "production_company_count": num_companies,
+        "cast_star_power":          star_power,
         "release_year":             year,
         "release_month":            month,
         "overview_word_count":      word_count(overview),
@@ -349,10 +397,11 @@ def make_prediction(state, genre, budget, runtime, year, month,
     classes = list(state["model"].classes_)
     conf    = round(float(np.max(proba)) * 100, 1)
     proba_d = {cls: round(float(p) * 100, 1) for cls, p in zip(classes, proba)}
-    return pred, conf, proba_d
+    return pred, conf, proba_d, found, not_found, star_power
 
 
-def build_explanation(pred, conf, budget, runtime, month, overview, num_keywords, num_companies):
+def build_explanation(pred, conf, budget, runtime, month, overview,
+                       num_keywords, num_companies, found, star_power, global_mean):
     sent   = sentiment_score(overview)
     subj   = subjectivity_score(overview)
     keys   = keyword_count(overview)
@@ -371,28 +420,35 @@ def build_explanation(pred, conf, budget, runtime, month, overview, num_keywords
     if 85 <= runtime <= 140:
         reasons.append("a commercially typical runtime")
     else:
-        reasons.append("an unusual runtime, which may affect audience accessibility")
+        reasons.append("an unusual runtime that may affect audience accessibility")
 
     if season == "summer":
         reasons.append("a summer release window — historically the strongest box office season")
     elif season == "holiday":
         reasons.append("a holiday release window — strong for family and awards films")
-    else:
-        reasons.append(f"a {season} release window — typically more competitive for streaming alternatives")
+
+    if found:
+        if star_power > global_mean * 1.1:
+            reasons.append(
+                f"a high-performing cast ({', '.join(found)}) whose past films "
+                f"averaged well above typical"
+            )
+        elif star_power < global_mean * 0.9:
+            reasons.append(
+                f"a cast ({', '.join(found)}) whose historical films have "
+                f"tended to underperform on average"
+            )
+        else:
+            reasons.append(f"a cast ({', '.join(found)}) with average historical performance")
 
     if num_companies >= 3:
         reasons.append("multiple production companies backing distribution")
-    elif num_companies == 0:
-        reasons.append("no listed production companies, which may limit distribution reach")
-
     if num_keywords >= 5:
         reasons.append("a rich set of tagged keywords indicating a well-developed concept")
-
     if sent > 0.20:
         reasons.append("a positive, emotionally appealing plot tone")
     elif sent < -0.10:
         reasons.append("a darker or more negative plot tone")
-
     if keys >= 3:
         reasons.append("multiple audience-appeal keywords in the description")
 
@@ -407,7 +463,7 @@ def build_explanation(pred, conf, budget, runtime, month, overview, num_keywords
 # ── App ───────────────────────────────────────────────────────────────────────
 
 st.title("🎬 Movie Performance Predictor")
-st.caption("Ensemble model (LR + Random Forest + Gradient Boosting) · Trained on 4,800+ TMDB films")
+st.caption("Ensemble model · Actor star power · Trained on 4,800+ TMDB films")
 
 state = load_and_train()
 
@@ -435,14 +491,15 @@ with st.sidebar:
     cast = st.slider("Cast Members",  1,  50,  8)
     crew = st.slider("Crew Members",  5, 200, 30)
 
-    num_companies = st.slider(
-        "Production Companies", 0, 10, 2,
-        help="How many production companies are attached to the project?"
-    )
+    num_companies = st.slider("Production Companies", 0, 10, 2)
+    num_keywords  = st.slider("Tagged Keywords / Concepts", 0, 30, 5)
 
-    num_keywords = st.slider(
-        "Tagged Keywords / Concepts", 0, 30, 5,
-        help="Roughly how many descriptive keywords or themes does this film have?"
+    actor_input = st.text_input(
+        "Main Cast (comma-separated)",
+        value="",
+        placeholder="e.g. Leonardo DiCaprio, Meryl Streep",
+        help=f"Type actor names from the TMDB database. "
+             f"The model knows {state['n_actors']:,} actors from historical films.",
     )
 
     overview = st.text_area(
@@ -452,7 +509,7 @@ with st.sidebar:
             "across the city during one unforgettable night filled with crime, "
             "revenge, and survival."
         ),
-        height=140,
+        height=130,
     )
 
     run_btn = st.button("🎬 Predict Performance", use_container_width=True)
@@ -465,15 +522,17 @@ with tab_pred:
         st.info("Fill in the movie details on the left and click **Predict Performance**.")
 
     if run_btn:
-        pred, conf, proba_d = make_prediction(
+        pred, conf, proba_d, found, not_found, star_power = make_prediction(
             state, genre, budget, runtime, year, month,
-            cast, crew, overview, num_keywords, num_companies
+            cast, crew, overview, num_keywords, num_companies,
+            actor_input
         )
         sent = sentiment_score(overview)
         subj = subjectivity_score(overview)
         keys = keyword_count(overview)
         wc   = word_count(overview)
 
+        # Result banner
         if "Well" in pred:
             st.success(f"### ✅ {pred}")
         elif "Average" in pred:
@@ -484,6 +543,25 @@ with tab_pred:
         st.metric("Ensemble Confidence", f"{conf}%")
         st.divider()
 
+        # Actor star power feedback
+        if actor_input.strip():
+            st.subheader("🎭 Cast Analysis")
+            if found:
+                pct = round((star_power / state["global_mean"] - 1) * 100, 1)
+                direction = "above" if pct >= 0 else "below"
+                st.success(
+                    f"**Recognized:** {', '.join(found)}  \n"
+                    f"Combined star power score is **{abs(pct)}% {direction}** the average actor in this dataset."
+                )
+            if not_found:
+                st.warning(
+                    f"**Not found in database:** {', '.join(not_found)}  \n"
+                    f"These actors aren't in the TMDB training data — "
+                    f"the model used the dataset average for them."
+                )
+            st.divider()
+
+        # Probabilities
         st.subheader("Class Probabilities")
         for lbl, prob in sorted(proba_d.items(), key=lambda x: -x[1]):
             st.write(f"**{lbl}** — {prob}%")
@@ -491,6 +569,7 @@ with tab_pred:
 
         st.divider()
 
+        # NLP signals
         st.subheader("NLP Analysis of Plot Summary")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Sentiment",       f"{sent:+.3f}", help="-1 = very negative · +1 = very positive")
@@ -500,10 +579,11 @@ with tab_pred:
 
         st.divider()
 
+        # Explanation
         st.subheader("Explanation")
         st.markdown(build_explanation(
-            pred, conf, budget, runtime, month,
-            overview, num_keywords, num_companies
+            pred, conf, budget, runtime, month, overview,
+            num_keywords, num_companies, found, star_power, state["global_mean"]
         ))
 
         st.divider()
@@ -517,12 +597,13 @@ with tab_model:
     st.dataframe(state["results_df"], use_container_width=True)
     st.caption(
         f"Final predictor: **{state['model_name']}** · "
-        f"Training rows: {state['n_train']} · Test rows: {state['n_test']}"
+        f"Training rows: {state['n_train']} · Test rows: {state['n_test']} · "
+        f"Actors in database: {state['n_actors']:,}"
     )
 
     st.divider()
 
-    st.subheader("Classification Report  (Ensemble)")
+    st.subheader("Classification Report (Ensemble)")
     st.code(state["report"], language=None)
 
     st.divider()
