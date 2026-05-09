@@ -117,34 +117,66 @@ def split_entered_names(text):
 
 
 def load_credit_parts():
-    """Read the split credits file parts and combine them."""
+    """Load and validate split TMDB credits files."""
+
     required = [
         "tmdb_5000_credits_part1.csv",
         "tmdb_5000_credits_part2.csv",
         "tmdb_5000_credits_part3.csv",
     ]
+
     missing = [f for f in required if not Path(f).exists()]
+
     if missing:
-        st.error("Missing credit file(s): " + ", ".join(missing))
+        st.error(
+            f"""
+            Missing required credit file(s):
+
+            {', '.join(missing)}
+
+            Make sure all split files are uploaded to GitHub.
+            """
+        )
         st.stop()
 
     parts = []
-    for file in required:
-        path = Path(file)
-        if path.stat().st_size == 0:
-            st.error(f"{file} is empty. Re-split the original credits CSV and upload this file again.")
-            st.stop()
-        try:
-            part = pd.read_csv(file, engine="python", on_bad_lines="skip")
-        except Exception as e:
-            st.error(f"Could not read {file}: {e}")
-            st.stop()
-        if part.empty or len(part.columns) == 0:
-            st.error(f"{file} has no readable data. Re-split and re-upload it.")
-            st.stop()
-        parts.append(part)
 
-    return pd.concat(parts, ignore_index=True)
+    for file in required:
+
+        try:
+
+            path = Path(file)
+
+            # Check for empty files
+            if path.stat().st_size == 0:
+                st.error(f"{file} is empty.")
+                st.stop()
+
+            # Read CSV safely
+            part = pd.read_csv(
+                file,
+                engine="python",
+                on_bad_lines="skip"
+            )
+
+            # Check for corrupted data
+            if part.empty or len(part.columns) == 0:
+                st.error(f"{file} contains no readable data.")
+                st.stop()
+
+            parts.append(part)
+
+        except pd.errors.EmptyDataError:
+            st.error(f"{file} is corrupted or improperly split.")
+            st.stop()
+
+        except Exception as e:
+            st.error(f"Error loading {file}: {e}")
+            st.stop()
+
+    credits = pd.concat(parts, ignore_index=True)
+
+    return credits
 
 
 def build_actor_stats(training_df):
@@ -699,7 +731,7 @@ with st.sidebar:
         height=150,
     )
 
-    run_btn = st.button("🎬 Predict Performance", use_container_width=True)
+    run_btn = st.button("🎬 Predict Performance", width="stretch")
 
 # Tabs
 tab_pred, tab_model, tab_data = st.tabs(["📊 Prediction", "🔬 Model Info", "🎭 Actor Data"])
@@ -780,7 +812,7 @@ with tab_pred:
 
 with tab_model:
     st.subheader("Model Comparison")
-    st.dataframe(state["results_df"], use_container_width=True)
+    st.dataframe(state["results_df"], width="stretch")
     st.caption(
         f"Best model selected by weighted F1: **{state['model_name']}** · "
         f"Training rows: {state['n_train']} · Test rows: {state['n_test']}"
@@ -797,11 +829,11 @@ with tab_model:
         index=[f"Actual: {l}" for l in state["cm_labels"]],
         columns=[f"Predicted: {l}" for l in state["cm_labels"]],
     )
-    st.dataframe(cm_df, use_container_width=True)
+    st.dataframe(cm_df, width="stretch")
 
     st.divider()
     st.subheader("All Feature Importances")
-    st.dataframe(state["importance_df"], use_container_width=True)
+    st.dataframe(state["importance_df"], width="stretch")
 
 with tab_data:
     st.subheader("Popular Actor History Used by the Model")
@@ -813,7 +845,7 @@ with tab_data:
         ["actor_high_success_rate", "actor_appearances", "actor_avg_revenue_log"],
         ascending=False,
     ).head(50)
-    st.dataframe(display_actor_stats, use_container_width=True)
+    st.dataframe(display_actor_stats, width="stretch")
 
     st.divider()
     st.subheader("Limitations")
